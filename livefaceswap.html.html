@@ -1,0 +1,207 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Light Live Face Swap</title>
+<style>
+  body { font-family: -apple-system, system-ui, Roboto, sans-serif; padding:12px; background:#f7f7f7; }
+  #wrap { display:flex; gap:12px; flex-wrap:wrap; }
+  video, canvas, img { width:100%; max-width:420px; border-radius:10px; background:#000; }
+  .col { flex:1 1 420px; min-width:260px; }
+  button { padding:10px 14px; border-radius:8px; border:0; background:#1a73e8; color:white; font-weight:600; }
+  small { color:#666; display:block; margin-top:8px; }
+</style>
+</head>
+<body>
+  <h2>Light Live Face Swap (client-side)</h2>
+  <div id="wrap">
+    <div class="col">
+      <p><strong>Camera</strong></p>
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="outCanvas" width="640" height="480" style="display:block;margin-top:8px"></canvas>
+    </div>
+
+    <div class="col">
+      <p><strong>Source face (upload)</strong></p>
+      <input id="srcFile" type="file" accept="image/*"/>
+      <img id="srcPreview" alt="source preview" style="margin-top:8px"/>
+      <p style="margin-top:10px">
+        <button id="toggleSwap">Enable Swap</button>
+      </p>
+      <small>Tip: use a front-facing portrait for best alignment.</small>
+    </div>
+  </div>
+
+  <!-- MediaPipe FaceMesh -->
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+<script>
+/* ---------- Helpers: compute affine matrix from 3 point pairs ---------- */
+/* Solve for matrix A 2x3 such that: [x'; y'] = A * [x; y; 1] */
+function affineFrom3Pairs(srcPts, dstPts) {
+  // srcPts/dstPts: arrays of 3 points: [{x,y},...]
+  // solve linear system for 6 unknowns
+  const M = [];
+  const b = [];
+  for (let i=0;i<3;i++) {
+    const sx = srcPts[i].x, sy = srcPts[i].y;
+    const dx = dstPts[i].x, dy = dstPts[i].y;
+    M.push([sx, sy, 1, 0, 0, 0]);
+    b.push(dx);
+    M.push([0, 0, 0, sx, sy, 1]);
+    b.push(dy);
+  }
+  // simple Gaussian elimination (6x6)
+  // convert to augmented matrix
+  for (let i=0;i<6;i++) M[i].push(b[i]);
+  const n = 6;
+  for (let i=0;i<n;i++) {
+    // pivot
+    let maxRow = i;
+    for (let k=i+1;k<n;k++) if (Math.abs(M[k][i]) > Math.abs(M[maxRow][i])) maxRow = k;
+    if (Math.abs(M[maxRow][i]) < 1e-9) continue;
+    [M[i], M[maxRow]] = [M[maxRow], M[i]];
+    // normalize
+    const piv = M[i][i];
+    for (let j=i;j<=n;j++) M[i][j] /= piv;
+    // eliminate
+    for (let r=0;r<n;r++) if (r!==i) {
+      const f = M[r][i];
+      for (let c=i;c<=n;c++) M[r][c] -= f * M[i][c];
+    }
+  }
+  const x = new Array(n);
+  for (let i=0;i<n;i++) x[i] = M[i][n];
+  // returns [a,b,c,d,e,f] matching canvas transform(a,b,c,d,e,f)
+  return x;
+}
+
+/* ---------- Setup UI ---------- */
+const video = document.getElementById('video');
+const outCanvas = document.getElementById('outCanvas');
+const ctx = outCanvas.getContext('2d');
+const srcFile = document.getElementById('srcFile');
+const srcPreview = document.getElementById('srcPreview');
+const toggleBtn = document.getElementById('toggleSwap');
+
+let swapEnabled = false;
+let srcImage = null;
+toggleBtn.onclick = () => { swapEnabled = !swapEnabled; toggleBtn.textContent = swapEnabled ? 'Disable Swap' : 'Enable Swap'; };
+
+srcFile.addEventListener('change', (ev) => {
+  const f = ev.target.files && ev.target.files[0];
+  if (!f) return;
+  const url = URL.createObjectURL(f);
+  srcPreview.src = url;
+  srcImage = new Image();
+  srcImage.crossOrigin = "anonymous";
+  srcImage.onload = () => { URL.revokeObjectURL(url); }
+  srcImage.src = url;
+});
+
+/* ---------- MediaPipe FaceMesh ---------- */
+const faceMesh = new FaceMesh({locateFile: (file) => {
+  return `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/`;
+}});
+faceMesh.setOptions({
+  maxNumFaces: 1,
+  refineLandmarks: false,
+  minDetectionConfidence: 0.5,
+  minTrackingConfidence: 0.5
+});
+
+faceMesh.onResults(onFaceResults);
+
+/* ---------- Camera stream ---------- */
+async function startCamera() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 }, audio:false });
+    video.srcObject = stream;
+    await video.play();
+    // use MediaPipe camera helper to send frames
+    const camera = new Camera(video, {
+      onFrame: async () => { await faceMesh.send({image: video}); },
+      width: 640, height: 480
+    });
+    camera.start();
+  } catch (e) {
+    alert("Camera error: " + e.message + "\nMake sure you opened this page via HTTPS and granted camera permission.");
+  }
+}
+
+/* ---------- Main onResults: draw video + swapped face ---------- */
+function onFaceResults(results) {
+  // draw video frame first
+  ctx.save();
+  ctx.clearRect(0,0,outCanvas.width,outCanvas.height);
+  // fit video into canvas
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const cw = outCanvas.width, ch = outCanvas.height;
+  // compute scaling to fill
+  const scale = Math.min(cw / vw, ch / vh);
+  const dw = vw * scale, dh = vh * scale;
+  const dx = (cw - dw)/2, dy = (ch - dh)/2;
+  ctx.drawImage(video, 0, 0, vw, vh, dx, dy, dw, dh);
+
+  if (swapEnabled && srcImage && results.multiFaceLandmarks && results.multiFaceLandmarks.length>0) {
+    const lm = results.multiFaceLandmarks[0]; // array of 468 landmarks normalized [0..1]
+    // choose three reliable points: left eye (33), right eye (263), nose tip (1)
+    const idxLeft = 33, idxRight = 263, idxNose = 1;
+    const tLeft = lm[idxLeft], tRight = lm[idxRight], tNose = lm[idxNose];
+    // convert normalized to canvas coords (matching the video draw)
+    const toCanvas = (p) => {
+      const x = dx + p.x * dw;
+      const y = dy + p.y * dh;
+      return {x,y};
+    };
+    const dstA = toCanvas(tLeft), dstB = toCanvas(tRight), dstC = toCanvas(tNose);
+
+    // For source image we need landmarks. For speed, approximate: manually pick approximate points:
+    // We'll use positions relative to source image: leftEye ~ (0.35w,0.38h), rightEye ~(0.65w,0.38h), nose ~(0.5w,0.55h)
+    const sw = srcImage.naturalWidth || srcImage.width, sh = srcImage.naturalHeight || srcImage.height;
+    const srcA = {x: sw * 0.35, y: sh * 0.38}, srcB = {x: sw * 0.65, y: sh * 0.38}, srcC = {x: sw * 0.50, y: sh * 0.55};
+
+    // compute affine transform
+    const affine = affineFrom3Pairs([srcA, srcB, srcC], [dstA, dstB, dstC]);
+    // affine is [a,b,c,d,e,f] mapping src -> dst for canvas transform
+    ctx.save();
+    // create soft mask to blend (feather)
+    const mask = ctx.createRadialGradient(dstC.x, dstC.y, Math.min(dw,dh)*0.08, dstC.x, dstC.y, Math.min(dw,dh)*0.28);
+    mask.addColorStop(0, 'rgba(255,255,255,1)');
+    mask.addColorStop(1, 'rgba(255,255,255,0)');
+    // draw transformed image into separate temporary canvas for better compositing
+    const tmp = document.createElement('canvas');
+    tmp.width = cw; tmp.height = ch;
+    const tctx = tmp.getContext('2d');
+    tctx.setTransform(affine[0], affine[1], affine[2], affine[3], affine[4], affine[5]);
+    // draw source image centered around its natural origin
+    tctx.drawImage(srcImage, 0, 0, sw, sh);
+    // apply mask on tctx
+    tctx.globalCompositeOperation = 'destination-in';
+    const mg = tctx.createRadialGradient(dstC.x, dstC.y, Math.min(dw,dh)*0.08, dstC.x, dstC.y, Math.min(dw,dh)*0.28);
+    mg.addColorStop(0, 'rgba(0,0,0,1)');
+    mg.addColorStop(1, 'rgba(0,0,0,0)');
+    tctx.fillStyle = mg;
+    tctx.beginPath();
+    tctx.rect(0,0,tmp.width,tmp.height);
+    tctx.fill();
+
+    // draw the tmp canvas over the video with light blending
+    ctx.globalAlpha = 0.95;
+    ctx.drawImage(tmp, 0, 0);
+    ctx.globalAlpha = 1.0;
+
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+
+/* ---------- Start ---------- */
+startCamera();
+
+</script>
+</body>
+</html>
